@@ -1,0 +1,252 @@
+// =============================================================================
+// GAP FILL STRATEGY — BACKTEST MANUEL DAILY (SPY)
+// Source : quantifiedstrategies.com/gap-fill-trading-strategies/
+//
+// POURQUOI UN BACKTEST MANUEL ET PAS UNE STRATEGY PINE ?
+// -----------------------------------------------------------------------------
+//  Sur graphique Daily, Pine Strategy ne peut pas simultanément :
+//    - Entrer à l'OPEN de la barre du gap
+//    - Vérifier si le TP est atteint pendant la journée (high >= TP)
+//    - Sortir au CLOSE si TP non atteint
+//  Ces 3 opérations nécessitent les données intraday de la même barre.
+//  Solution : backtest manuel barre-par-barre avec `open`, `high`, `close`.
+//
+//  → Aucun biais lookahead : on utilise uniquement des données accessibles
+//    en temps réel à l'ouverture (open, prev_close, prev_range).
+//    `high >= TP` simule un ordre LIMIT actif toute la journée.
+//
+// RÈGLES ORIGINALES
+// -----------------------------------------------------------------------------
+//  Source : Quantified Strategies (Connors / adaptations)
+//  1. Gap DOWN entre -0.15% et -0.6% (open vs close[1])
+//  2. Filtre range J-1 : (close[1]-low[1])/(high[1]-low[1]) < 0.25
+//     → veille clôturée dans le quart inférieur de sa range
+//  3. Entrée à l'ouverture (open du gap day)
+//  4. TP = 75% du gap = open + 0.75 × (close[1] - open)
+//  5. Sortie EOD au close si TP non atteint (pas de stop intraday)
+//
+// RÉSULTATS REPORTÉS (jan 2010 – août 2012)
+//  - 110 signaux, 98 gagnants → WR = 89%
+//  - Gain moyen : +0.19% par trade
+//
+// LIMITES DE CE BACKTEST
+// -----------------------------------------------------------------------------
+//  1. Biais d'instantanéité de l'ouverture : dans la vraie vie, si SPY gape
+//     à -0.5%, la première tick n'est pas toujours le min intraday. Le bid/ask
+//     spread d'ouverture peut coûter 0.02-0.05% de plus.
+//  2. Nous utilisons BATS:SPY qui a des données depuis 1993. Pour ~2010-2012
+//     (période du claim), on peut filtrer.
+//  3. La stratégie est LONG ONLY sur gap DOWN (mean-reversion).
+//  4. Le "% de capital par trade" est une hypothèse (choix libre).
+// =============================================================================
+
+//@version=6
+indicator(
+  title     = "Gap Fill Backtest (Manual Daily)",
+  shorttitle= "GAPFILL-D",
+  overlay   = true
+)
+
+// =============================================================================
+// PARAMÈTRES
+// =============================================================================
+grp_gap = "Gap Parameters"
+gap_min = input.float(-0.6,  "Gap min (%)",        group=grp_gap, minval=-5.0,  maxval=-0.01)
+gap_max = input.float(-0.15, "Gap max (%)",         group=grp_gap, minval=-3.0,  maxval=-0.01)
+
+grp_flt = "Filtres"
+use_range_flt = input.bool(true,  "Filtre range J-1",      group=grp_flt)
+range_thr     = input.float(0.25, "Seuil range J-1 (<)",   group=grp_flt, minval=0.05, maxval=0.95)
+use_sma_flt   = input.bool(false, "Filtre SMA 200 (prix >)",group=grp_flt)
+sma200_len    = input.int(200,    "Période SMA filtre",     group=grp_flt, minval=50)
+
+grp_exit = "Exit"
+tp_ratio  = input.float(0.75, "TP = X% du gap",     group=grp_exit, minval=0.1, maxval=2.0,
+             tooltip="0.75 = 75% de fill. 1.0 = gap entièrement comblé.")
+use_eod_stop = input.bool(true, "Sortie EOD si TP non atteint", group=grp_exit,
+             tooltip="Si false : sort sur le close du lendemain (moins réaliste).")
+
+grp_risk = "Capital"
+capital_pct   = input.float(95.0, "Capital par trade (%)", group=grp_risk, minval=1.0, maxval=100.0)
+initial_cap   = input.float(10000.0, "Capital initial ($)", group=grp_risk, minval=100.0)
+
+grp_period = "Période d'analyse (optionnel)"
+filter_dates  = input.bool(false, "Filtrer par dates",         group=grp_period)
+date_start    = input.time(timestamp("2010-01-01"), "Date début", group=grp_period)
+date_end      = input.time(timestamp("2025-12-31"), "Date fin",   group=grp_period)
+
+// =============================================================================
+// INDICATEURS
+// =============================================================================
+sma200 = ta.sma(close, sma200_len)
+plot(use_sma_flt ? sma200 : na, "SMA 200", color.new(color.orange, 30), linewidth=2)
+
+// =============================================================================
+// CONDITIONS DE SIGNAL
+// =============================================================================
+gap_pct    = (open - close[1]) / close[1] * 100
+is_gap_down = gap_pct >= gap_min and gap_pct <= gap_max
+
+range_j1   = high[1] - low[1]
+range_pos  = range_j1 > 0 ? (close[1] - low[1]) / range_j1 : 0.5
+range_ok   = not use_range_flt or range_pos < range_thr
+
+sma_ok     = not use_sma_flt or open > sma200
+
+date_ok    = not filter_dates or (time >= date_start and time <= date_end)
+
+signal     = is_gap_down and range_ok and sma_ok and date_ok
+
+// =============================================================================
+// CALCUL DU TAKE PROFIT ET DU RÉSULTAT BARRE PAR BARRE
+// =============================================================================
+// Entrée : open du gap day
+// TP     : open + tp_ratio × (close[1] - open)
+// Résultat:
+//   Si high >= tp → gagnant, P&L = tp - open
+//   Sinon         → perdant, P&L = close - open (EOD exit)
+
+gap_abs  = close[1] - open          // positif car gap down
+tp_price = open + tp_ratio * gap_abs
+
+is_winner = signal and high >= tp_price
+is_loser  = signal and high < tp_price
+
+trade_pnl_pts = signal ? (is_winner ? (tp_price - open) : (close - open)) : 0.0
+trade_pnl_pct = signal and open > 0 ? trade_pnl_pts / open * 100.0 : 0.0
+
+// =============================================================================
+// ACCUMULATION DES STATISTIQUES
+// =============================================================================
+var int   n_trades    = 0
+var int   n_wins      = 0
+var int   n_losses    = 0
+var float cum_pnl_pct = 0.0
+var float sum_win_pct = 0.0
+var float sum_los_pct = 0.0
+var float max_loss_pct = 0.0    // pire trade (valeur absolue)
+var float equity      = initial_cap
+
+// Array pour tracker les returns (calcul drawdown approximatif)
+var array<float> equity_arr = array.new_float(0)
+
+if signal
+    n_trades    += 1
+    cum_pnl_pct += trade_pnl_pct
+
+    // Equity compounding
+    trade_dollar = equity * (capital_pct / 100.0) * (trade_pnl_pct / 100.0)
+    equity      += trade_dollar
+
+    array.push(equity_arr, equity)
+
+    if is_winner
+        n_wins    += 1
+        sum_win_pct += trade_pnl_pct
+    else
+        n_losses  += 1
+        sum_los_pct += math.abs(trade_pnl_pct)
+        if math.abs(trade_pnl_pct) > max_loss_pct
+            max_loss_pct := math.abs(trade_pnl_pct)
+
+// Drawdown calculé sur l'equity curve
+var float peak_equity = initial_cap
+var float max_dd_pct  = 0.0
+
+if signal
+    if equity > peak_equity
+        peak_equity := equity
+    dd = (peak_equity - equity) / peak_equity * 100.0
+    if dd > max_dd_pct
+        max_dd_pct := dd
+
+// =============================================================================
+// VISUALISATION DES SIGNAUX SUR LE CHART
+// =============================================================================
+plotshape(signal and is_winner, "Winner", shape.labelup,   location.belowbar,
+          color.new(color.lime,  0), text="✓", textcolor=color.black, size=size.tiny)
+plotshape(signal and is_loser,  "Loser",  shape.labeldown, location.abovebar,
+          color.new(color.red,   0), text="✗", textcolor=color.white, size=size.tiny)
+
+// TP line visualisation (sur les barres avec position ouverte)
+plot(signal ? tp_price : na, "TP", color.new(color.lime, 50), linewidth=1, style=plot.style_linebr)
+
+// =============================================================================
+// TABLE DE RÉSULTATS (coin haut-droite)
+// =============================================================================
+var table t = table.new(position.top_right, 2, 16,
+  border_width=1, border_color=color.gray,
+  bgcolor=color.new(color.black, 60))
+
+if barstate.islast and n_trades > 0
+    wr       = n_wins   / n_trades * 100.0
+    pf_num   = sum_win_pct
+    pf_den   = sum_los_pct
+    pf       = pf_den > 0 ? pf_num / pf_den : 0.0
+    avg_win  = n_wins   > 0 ? sum_win_pct / n_wins   : 0.0
+    avg_loss = n_losses > 0 ? sum_los_pct / n_losses : 0.0
+    net_pnl  = equity - initial_cap
+
+    hdr = color.new(color.navy, 50)
+    table.cell(t, 0, 0,  "GAP FILL DAILY (SPY)", text_color=color.white, text_size=size.small, bgcolor=hdr)
+    table.cell(t, 1, 0,  "RÉSULTAT",             text_color=color.white, text_size=size.small, bgcolor=hdr)
+
+    table.cell(t, 0, 1,  "Trades",     text_color=color.silver, text_size=size.small)
+    table.cell(t, 1, 1,  str.tostring(n_trades),
+               text_color=n_trades >= 100 ? color.lime : color.orange, text_size=size.small)
+
+    table.cell(t, 0, 2,  "Win Rate",   text_color=color.silver, text_size=size.small)
+    table.cell(t, 1, 2,  str.tostring(wr, "#.1") + "%",
+               text_color=wr >= 75 ? color.lime : wr >= 60 ? color.yellow : color.red, text_size=size.small)
+
+    table.cell(t, 0, 3,  "Profit Factor", text_color=color.silver, text_size=size.small)
+    table.cell(t, 1, 3,  str.tostring(pf, "#.##"),
+               text_color=pf >= 2.0 ? color.lime : pf >= 1.0 ? color.yellow : color.red, text_size=size.small)
+
+    table.cell(t, 0, 4,  "Net P&L ($)",  text_color=color.silver, text_size=size.small)
+    table.cell(t, 1, 4,  str.tostring(net_pnl, "#.#") + " USD",
+               text_color=net_pnl > 0 ? color.lime : color.red, text_size=size.small)
+
+    table.cell(t, 0, 5,  "Net P&L (%)",  text_color=color.silver, text_size=size.small)
+    table.cell(t, 1, 5,  str.tostring(cum_pnl_pct, "#.##") + "%",
+               text_color=cum_pnl_pct > 0 ? color.lime : color.red, text_size=size.small)
+
+    table.cell(t, 0, 6,  "Max DD",    text_color=color.silver, text_size=size.small)
+    table.cell(t, 1, 6,  str.tostring(max_dd_pct, "#.##") + "%",
+               text_color=max_dd_pct < 5 ? color.lime : max_dd_pct < 15 ? color.yellow : color.red, text_size=size.small)
+
+    table.cell(t, 0, 7,  "W / L",     text_color=color.silver, text_size=size.small)
+    table.cell(t, 1, 7,  str.tostring(n_wins) + " / " + str.tostring(n_losses),
+               text_color=color.silver, text_size=size.small)
+
+    table.cell(t, 0, 8,  "Avg Win",   text_color=color.silver, text_size=size.small)
+    table.cell(t, 1, 8,  "+" + str.tostring(avg_win, "#.3") + "%",
+               text_color=color.lime, text_size=size.small)
+
+    table.cell(t, 0, 9,  "Avg Loss",  text_color=color.silver, text_size=size.small)
+    table.cell(t, 1, 9,  "-" + str.tostring(avg_loss, "#.3") + "%",
+               text_color=color.red, text_size=size.small)
+
+    table.cell(t, 0, 10, "Best trade", text_color=color.silver, text_size=size.small)
+    table.cell(t, 1, 10, "+" + str.tostring(avg_win > 0 ? sum_win_pct / math.max(1, n_wins) : 0.0, "#.3") + "%",
+               text_color=color.lime, text_size=size.small)
+
+    table.cell(t, 0, 11, "Worst trade",text_color=color.silver, text_size=size.small)
+    table.cell(t, 1, 11, "-" + str.tostring(max_loss_pct, "#.3") + "%",
+               text_color=color.red, text_size=size.small)
+
+    table.cell(t, 0, 12, "Equity fin", text_color=color.silver, text_size=size.small)
+    table.cell(t, 1, 12, str.tostring(equity, "#.#") + " USD",
+               text_color=equity > initial_cap ? color.lime : color.red, text_size=size.small)
+
+    table.cell(t, 0, 13, "Gap range",  text_color=color.gray,   text_size=size.small)
+    table.cell(t, 1, 13, str.tostring(gap_min) + "% / " + str.tostring(gap_max) + "%",
+               text_color=color.gray, text_size=size.small)
+
+    table.cell(t, 0, 14, "TP ratio",   text_color=color.gray,   text_size=size.small)
+    table.cell(t, 1, 14, str.tostring(tp_ratio * 100, "#") + "% gap fill",
+               text_color=color.gray, text_size=size.small)
+
+    table.cell(t, 0, 15, "Claim source",text_color=color.gray,  text_size=size.small)
+    table.cell(t, 1, 15, "89% WR / +0.19%",
+               text_color=color.gray, text_size=size.small)

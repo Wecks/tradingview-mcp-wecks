@@ -1,0 +1,251 @@
+// =============================================================================
+// H1 FOREX STRATEGY BACKTEST — v2
+// Based on: "The 1-Hour Forex Strategy — 87% Win Rate Method"
+//
+// CORRECTIONS v2 vs v1
+// -----------------------------------------------------------------------------
+//  FIX 1 — ENTRÉE STOP ORDER (BUG CRITIQUE v1)
+//    v1 utilisait strategy.entry() sans paramètre stop → exécution au MARCHÉ
+//    → SL touché immédiatement sur la même barre car prix d'entrée ≠ prix stop
+//    v2 utilise strategy.entry(..., stop=price) → ordre stop réel
+//    La position ne s'ouvre QUE si le prix franchit l'extrême du pattern
+//
+//  FIX 2 — MÉMOIRE DE PLUSIEURS PIVOTS
+//    v1 ne gardait qu'un seul pivot high et un seul pivot low
+//    → Les confluences "niveau clé" étaient presque jamais actives
+//    v2 stocke les 5 derniers pivots hauts et bas dans des arrays
+//    → Zone support/résistance active si ≥1 pivot dans la zone ±key_zone pips
+//
+// LIMITES RÉSIDUELLES (documentées)
+// -----------------------------------------------------------------------------
+//  - En H1, un ordre stop peut être "skipped" si la bougie suivante ne remonte
+//    pas au-dessus du high. TradingView annule l'ordre sur la barre suivante
+//    si non déclenché → comportement CORRECT pour cette stratégie.
+//  - Les pivots détectés par ta.pivothigh/low ont un lag de swing_len barres.
+//    Ce lag est inhérent à une détection non-repaint. Acceptable pour backtest.
+//  - Le spread n'est pas inclus par défaut (commission_value = 0.004% ≈ 0.4 pip)
+// =============================================================================
+
+//@version=6
+strategy(
+  title         = "H1 Forex Strategy v2 — Stop Orders",
+  shorttitle    = "H1-PA-v2",
+  overlay       = true,
+  initial_capital = 10000,
+  default_qty_type  = strategy.percent_of_equity,
+  default_qty_value = 2,
+  commission_type   = strategy.commission.percent,
+  commission_value  = 0.004,
+  slippage          = 1,
+  calc_on_order_fills = false,
+  process_orders_on_close = false
+)
+
+// =============================================================================
+// PARAMÈTRES
+// =============================================================================
+grp_trend  = "Tendance"
+ema_len    = input.int(50,  "EMA Tendance (barres)",     group=grp_trend, minval=5)
+
+grp_kl     = "Niveaux Clés"
+swing_len  = input.int(20,  "Lookback swing pivot",      group=grp_kl, minval=5)
+key_zone   = input.float(15.0, "Zone niveau clé (pips)", group=grp_kl, minval=1.0)
+max_pivots = input.int(5,   "Nb pivots en mémoire",      group=grp_kl, minval=1, maxval=10)
+
+grp_pb     = "Pin Bar"
+pb_wick    = input.float(55.0, "Wick min (% range totale)",  group=grp_pb, minval=30.0, maxval=95.0)
+pb_body    = input.float(45.0, "Corps max (% range totale)", group=grp_pb, minval=5.0,  maxval=65.0)
+
+grp_rr     = "Risk / Reward"
+rr_ratio   = input.float(2.0,  "RR minimum",  group=grp_rr, minval=1.0)
+sl_buffer  = input.float(2.0,  "Buffer SL (pips)", group=grp_rr, minval=0.5)
+
+grp_sess   = "Session Filter"
+use_session = input.bool(true,  "Activer filtre session",     group=grp_sess)
+lon_open    = input.int(7,  "London open (heure UTC)",   group=grp_sess, minval=0, maxval=23)
+lon_close   = input.int(10, "London close (heure UTC)",  group=grp_sess, minval=0, maxval=23)
+ny_open     = input.int(12, "NY open (heure UTC)",       group=grp_sess, minval=0, maxval=23)
+ny_close    = input.int(15, "NY close (heure UTC)",      group=grp_sess, minval=0, maxval=23)
+
+grp_vis    = "Visuel"
+show_ema     = input.bool(true,  "Afficher EMA 50",        group=grp_vis)
+show_swing   = input.bool(true,  "Afficher pivots swing",  group=grp_vis)
+show_signals = input.bool(true,  "Afficher signaux entry", group=grp_vis)
+
+// =============================================================================
+// PIP SIZE
+// Mintick EUR/USD = 0.00001 → 1 pip = 10 * mintick = 0.0001
+// Mintick EUR/JPY = 0.001   → 1 pip = 10 * mintick = 0.01
+// =============================================================================
+pip_size = syminfo.mintick * 10
+
+// =============================================================================
+// TENDANCE — EMA 50
+// =============================================================================
+ema50 = ta.ema(close, ema_len)
+is_uptrend   = close > ema50
+is_downtrend = close < ema50
+
+plot(show_ema ? ema50 : na, "EMA 50",
+     color=is_uptrend ? color.new(color.teal, 0) : color.new(color.red, 0),
+     linewidth=2)
+
+// =============================================================================
+// NIVEAUX CLÉS — Swing Pivots (array des N derniers)
+// FIX v2 : on stocke les max_pivots derniers pivots dans des arrays
+// =============================================================================
+swing_high = ta.pivothigh(high, swing_len, swing_len)
+swing_low  = ta.pivotlow(low,  swing_len, swing_len)
+
+// Arrays pour les pivots hauts/bas récents
+var array<float> pivot_highs = array.new_float(0)
+var array<float> pivot_lows  = array.new_float(0)
+
+if not na(swing_high)
+    array.unshift(pivot_highs, swing_high)
+    if array.size(pivot_highs) > max_pivots
+        array.pop(pivot_highs)
+
+if not na(swing_low)
+    array.unshift(pivot_lows, swing_low)
+    if array.size(pivot_lows) > max_pivots
+        array.pop(pivot_lows)
+
+// Prix est "au niveau d'un pivot" si dans ±key_zone pips d'au moins 1 pivot
+zone = key_zone * pip_size
+
+at_resistance = false
+if array.size(pivot_highs) > 0
+    for i = 0 to array.size(pivot_highs) - 1
+        if math.abs(close - array.get(pivot_highs, i)) <= zone
+            at_resistance := true
+            break
+
+at_support = false
+if array.size(pivot_lows) > 0
+    for i = 0 to array.size(pivot_lows) - 1
+        if math.abs(close - array.get(pivot_lows, i)) <= zone
+            at_support := true
+            break
+
+plotshape(show_swing and not na(swing_high), "Pivot High", shape.triangledown, location.abovebar, color.new(color.red,   40), size=size.tiny)
+plotshape(show_swing and not na(swing_low),  "Pivot Low",  shape.triangleup,   location.belowbar, color.new(color.green, 40), size=size.tiny)
+
+// =============================================================================
+// PATTERNS — Pin Bar & Inside Bar
+// =============================================================================
+bar_range  = high - low
+bar_body   = math.abs(close - open)
+upper_wick = high - math.max(open, close)
+lower_wick = math.min(open, close) - low
+range_safe = bar_range == 0 ? 0.00001 : bar_range
+
+// Pin Bar Bullish : wick bas dominant, clôture dans le tiers supérieur
+pb_bull = (lower_wick / range_safe * 100 >= pb_wick) and
+          (bar_body   / range_safe * 100 <= pb_body)  and
+          (close >= low + bar_range * 0.5)
+
+// Pin Bar Bearish : wick haut dominant, clôture dans le tiers inférieur
+pb_bear = (upper_wick / range_safe * 100 >= pb_wick) and
+          (bar_body   / range_safe * 100 <= pb_body)  and
+          (close <= high - bar_range * 0.5)
+
+// Inside Bar : range strictement contenue dans la barre précédente
+ib = high < high[1] and low > low[1]
+
+// =============================================================================
+// FILTRE SESSION — London 07-10h UTC, NY 12-15h UTC
+// =============================================================================
+bar_hour   = hour(time, "UTC")
+in_london  = bar_hour >= lon_open  and bar_hour < lon_close
+in_ny      = bar_hour >= ny_open   and bar_hour < ny_close
+in_session = use_session ? (in_london or in_ny) : true
+
+// =============================================================================
+// CONDITIONS D'ENTRÉE (3 confluences)
+// =============================================================================
+long_signal  = is_uptrend   and at_support    and (pb_bull or ib) and in_session and strategy.position_size == 0
+short_signal = is_downtrend and at_resistance and (pb_bear or ib) and in_session and strategy.position_size == 0
+
+// =============================================================================
+// PRIX STOP ENTRY, SL ET TP
+// FIX v2 : stop order → la position s'ouvre UNIQUEMENT si le prix franchit
+// l'extrême du pattern. Si non franchi sur la barre suivante, l'ordre expire.
+// =============================================================================
+buf = sl_buffer * pip_size
+
+// LONG : stop d'achat 1 pip au-dessus du haut du pattern
+long_entry = high + buf
+long_sl    = low  - buf
+long_tp    = long_entry + rr_ratio * (long_entry - long_sl)
+
+// SHORT : stop de vente 1 pip en dessous du bas du pattern
+short_entry = low  - buf
+short_sl    = high + buf
+short_tp    = short_entry - rr_ratio * (short_sl - short_entry)
+
+// =============================================================================
+// ORDRES STRATÉGIE — FIX v2 : stop= pour simuler les ordres stop réels
+// =============================================================================
+if long_signal
+    strategy.entry("Long", strategy.long, stop=long_entry, comment="PB/IB Long")
+    strategy.exit("Long Exit", "Long", stop=long_sl, limit=long_tp, comment="SL/TP")
+
+if short_signal
+    strategy.entry("Short", strategy.short, stop=short_entry, comment="PB/IB Short")
+    strategy.exit("Short Exit", "Short", stop=short_sl, limit=short_tp, comment="SL/TP")
+
+// Annulation : si un nouveau signal contraire apparaît, fermer la position
+if long_signal[0] and strategy.position_size < 0
+    strategy.close("Short", comment="Reversal")
+if short_signal[0] and strategy.position_size > 0
+    strategy.close("Long", comment="Reversal")
+
+// =============================================================================
+// VISUALISATION
+// =============================================================================
+plotshape(show_signals and long_signal,  "Long",  shape.labelup,   location.belowbar, color.new(color.lime, 0), text="L", textcolor=color.black, size=size.small)
+plotshape(show_signals and short_signal, "Short", shape.labeldown, location.abovebar, color.new(color.red,  0), text="S", textcolor=color.white, size=size.small)
+
+bgcolor(in_london and use_session ? color.new(color.blue,   92) : na, title="London")
+bgcolor(in_ny     and use_session ? color.new(color.orange, 92) : na, title="NY")
+
+// =============================================================================
+// TABLE DE STATS (coin haut-droit)
+// =============================================================================
+var table stats = table.new(position.top_right, 2, 9,
+  border_width=1, border_color=color.gray,
+  bgcolor=color.new(color.black, 70))
+
+if barstate.islast
+    tot   = strategy.closedtrades
+    wins  = strategy.wintrades
+    loss  = strategy.losstrades
+    wr    = tot > 0 ? wins / tot * 100 : 0.0
+    pf    = strategy.grossloss != 0 ? strategy.grossprofit / math.abs(strategy.grossloss) : 0.0
+    net   = strategy.netprofit
+    dd    = strategy.max_drawdown
+
+    hdr_c = color.new(color.navy, 50)
+    table.cell(stats, 0, 0, "MÉTRIQUE",  text_color=color.silver, text_size=size.small, bgcolor=hdr_c)
+    table.cell(stats, 1, 0, "VALEUR",    text_color=color.silver, text_size=size.small, bgcolor=hdr_c)
+    table.cell(stats, 0, 1, "Trades",    text_color=color.white,  text_size=size.small)
+    table.cell(stats, 1, 1, str.tostring(tot), text_color=color.yellow, text_size=size.small)
+    table.cell(stats, 0, 2, "Win Rate",  text_color=color.white,  text_size=size.small)
+    table.cell(stats, 1, 2, str.tostring(wr, "#.#") + "%",
+               text_color=wr >= 60 ? color.lime : color.orange, text_size=size.small)
+    table.cell(stats, 0, 3, "Profit Factor", text_color=color.white, text_size=size.small)
+    table.cell(stats, 1, 3, str.tostring(pf, "#.##"),
+               text_color=pf >= 1.5 ? color.lime : color.orange, text_size=size.small)
+    table.cell(stats, 0, 4, "Net P&L ($)", text_color=color.white, text_size=size.small)
+    table.cell(stats, 1, 4, str.tostring(net, "#.##"),
+               text_color=net > 0 ? color.lime : color.red, text_size=size.small)
+    table.cell(stats, 0, 5, "Max DD",    text_color=color.white,  text_size=size.small)
+    table.cell(stats, 1, 5, str.tostring(dd, "#.##") + "%", text_color=color.orange, text_size=size.small)
+    table.cell(stats, 0, 6, "W / L",     text_color=color.white,  text_size=size.small)
+    table.cell(stats, 1, 6, str.tostring(wins) + " / " + str.tostring(loss),
+               text_color=color.silver, text_size=size.small)
+    table.cell(stats, 0, 7, "RR Ratio",  text_color=color.white,  text_size=size.small)
+    table.cell(stats, 1, 7, "1:" + str.tostring(rr_ratio, "#.#"), text_color=color.silver, text_size=size.small)
+    table.cell(stats, 0, 8, "Claim blog",text_color=color.gray,   text_size=size.small)
+    table.cell(stats, 1, 8, "87% WR ??", text_color=color.gray,   text_size=size.small)

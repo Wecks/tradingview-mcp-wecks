@@ -1,0 +1,238 @@
+// =============================================================================
+// LARRY CONNORS RSI(2) STRATEGY — BACKTEST RIGOUREUX
+// Source : chartschool.stockcharts.com/...rsi-2
+// Instrument canonique : SPY (SPDR S&P 500 ETF) — Daily
+//
+// RÈGLES ORIGINALES (Connors)
+// -----------------------------------------------------------------------------
+//  LONG  : Prix > SMA(200) ET RSI(2) < seuil_bas (défaut 10)
+//           Sortie : Prix croise au-dessus SMA(5)
+//  SHORT : Prix < SMA(200) ET RSI(2) > seuil_haut (défaut 90)
+//           Sortie : Prix croise en dessous SMA(5)
+//  Connors : PAS de stop-loss (testé ici avec et sans)
+//
+// CHOIX DE DESIGN
+// -----------------------------------------------------------------------------
+//  1. INSTRUMENT : SPY Daily — le test original de Connors. Les résultats
+//     sur forex seront différents car la stratégie exploite le biais haussier
+//     structurel des indices US.
+//
+//  2. ENTRÉE : On entre à l'OPEN de la barre suivante (simulation réaliste).
+//     Pas d'entrée intrabar — évite le lookahead bias.
+//
+//  3. POSITION UNIQUE : On n'ouvre pas de nouvelle position si déjà exposé.
+//     Connors pyramide parfois, mais on reste conservateur pour le backtest.
+//
+//  4. STOP LOSS : Optionnel (Connors s'y oppose mais c'est risqué sans).
+//     On teste avec ATR stop configurable.
+//
+//  5. OPTIMISATION SANS OVERFIT : Les paramètres sont exposés (RSI seuil,
+//     SMA exit period). On évite de chercher le meilleur paramètre sur la
+//     même période que le backtest → biais de data snooping. Pour comparer
+//     correctement, on utilise des valeurs proches des originales de Connors.
+//
+// MÉTRIQUES CIBLES
+// -----------------------------------------------------------------------------
+//  - Win Rate minimum : à voir (Connors annonce ~65-70% sur long uniquement)
+//  - Trades minimum : 100 (sur 10+ ans de SPY daily, facile à atteindre)
+//  - Sharpe ratio > 0.5 pour un edge réel
+//
+// LIMITES
+// -----------------------------------------------------------------------------
+//  - Biais de survie : SPY existe depuis 1993, période de test = bull market
+//    structurel. WR sera gonflé vs un instrument en bear trend.
+//  - Commission : 0.1% par trade (approximation ETF réaliste).
+//  - Slippage : 1 tick inclus.
+//  - "Pas de SL" de Connors est dangereux en practice (voir mars 2020 -30%).
+// =============================================================================
+
+//@version=6
+strategy(
+  title             = "Connors RSI(2) Strategy — Optimisé",
+  shorttitle        = "RSI2-OPT",
+  overlay           = true,
+  initial_capital   = 10000,
+  default_qty_type  = strategy.percent_of_equity,
+  default_qty_value = 100,           // 100% du capital (Connors, fully invested)
+  commission_type   = strategy.commission.percent,
+  commission_value  = 0.05,
+  slippage          = 1,
+  calc_on_order_fills = false,
+  process_orders_on_close = false
+)
+
+// =============================================================================
+// PARAMÈTRES
+// =============================================================================
+grp_sig  = "Signaux RSI(2)"
+rsi_len     = input.int(2,   "Période RSI",           group=grp_sig, minval=1,  maxval=20)
+rsi_entry_l = input.float(5,  "Seuil entrée LONG (RSI <)", group=grp_sig, minval=1, maxval=40,
+               tooltip="Connors strict = 5 (meilleur WR). Connors original = 10 (plus de trades).")
+rsi_entry_s = input.float(95, "Seuil entrée SHORT (RSI >)", group=grp_sig, minval=60, maxval=99,
+               tooltip="Connors strict = 95.")
+rsi_exit_l  = input.float(65, "RSI exit LONG (RSI >)",  group=grp_sig, minval=50, maxval=99,
+               tooltip="Connors : RSI > 65 = sortie long (alternative à SMA5).")
+rsi_exit_s  = input.float(35, "RSI exit SHORT (RSI <)", group=grp_sig, minval=1,  maxval=50)
+
+grp_ma   = "Moyennes Mobiles"
+sma200_len  = input.int(200, "SMA tendance (filtre)",  group=grp_ma, minval=50,  maxval=300)
+sma5_len    = input.int(5,   "SMA exit (close > SMA)", group=grp_ma, minval=2,   maxval=20,
+               tooltip="Connors : sortir quand prix > SMA(5) pour long.")
+exit_method = input.string("Les deux",  "Méthode de sortie", options=["SMA5", "RSI", "Les deux"],
+               group=grp_ma,
+               tooltip="SMA5 = sortie quand prix > SMA5 (original Connors) | RSI = sortie quand RSI > seuil | Les deux = premier atteint.")
+
+grp_risk = "Gestion du Risque"
+use_sl      = input.bool(false, "Activer Stop Loss",     group=grp_risk,
+               tooltip="Connors ne recommande PAS de SL. Activer pour voir l'impact.")
+sl_atr_mult = input.float(3.0,  "Stop Loss (× ATR 14)", group=grp_risk, minval=0.5, maxval=10.0)
+use_long    = input.bool(true,  "Activer trades LONG",  group=grp_risk)
+use_short   = input.bool(false, "Activer trades SHORT", group=grp_risk,
+               tooltip="Short sur SPY moins fiable (biais haussier structurel). Désactivé par défaut.")
+
+grp_vis  = "Visuel"
+show_sma200 = input.bool(true, "Afficher SMA 200",  group=grp_vis)
+show_sma5   = input.bool(true, "Afficher SMA 5",    group=grp_vis)
+
+// =============================================================================
+// INDICATEURS
+// =============================================================================
+rsi2   = ta.rsi(close, rsi_len)
+sma200 = ta.sma(close, sma200_len)
+sma5   = ta.sma(close, sma5_len)
+atr14  = ta.atr(14)
+
+above200 = close > sma200
+below200 = close < sma200
+
+plot(show_sma200 ? sma200 : na, "SMA 200", color=color.new(color.orange, 0), linewidth=2)
+plot(show_sma5   ? sma5   : na, "SMA 5",   color=color.new(color.aqua,   0), linewidth=1)
+
+// RSI dans un panneau séparé — on le plot via une valeur normalisée
+// (le plot ira dans le même panneau overlay mais sert de référence visuelle)
+
+// =============================================================================
+// CONDITIONS D'ENTRÉE
+// Crossunder/crossover calculés en global (Pine v6 exige variables globales)
+// =============================================================================
+rsi_crossed_low  = ta.crossunder(rsi2, rsi_entry_l)
+rsi_crossed_high = ta.crossover(rsi2,  rsi_entry_s)
+
+long_condition  = above200 and rsi_crossed_low  and use_long
+short_condition = below200 and rsi_crossed_high and use_short
+
+// =============================================================================
+// CONDITIONS DE SORTIE
+// =============================================================================
+// Sortie LONG
+exit_long_sma  = close > sma5
+exit_long_rsi  = rsi2 > rsi_exit_l
+exit_long = switch exit_method
+    "SMA5"    => exit_long_sma
+    "RSI"     => exit_long_rsi
+    "Les deux"=> exit_long_sma or exit_long_rsi
+    => exit_long_sma
+
+// Sortie SHORT
+exit_short_sma = close < sma5
+exit_short_rsi = rsi2 < rsi_exit_s
+exit_short = switch exit_method
+    "SMA5"    => exit_short_sma
+    "RSI"     => exit_short_rsi
+    "Les deux"=> exit_short_sma or exit_short_rsi
+    => exit_short_sma
+
+// =============================================================================
+// GESTION DES ORDRES
+// =============================================================================
+var float entry_price = na
+var float sl_price    = na
+
+// --- LONG ---
+if long_condition and strategy.position_size == 0
+    strategy.entry("Long", strategy.long, comment="RSI2 oversold")
+    entry_price := close
+    sl_price    := use_sl ? close - sl_atr_mult * atr14 : na
+
+if strategy.position_size > 0
+    if use_sl and not na(sl_price)
+        strategy.exit("Long SL", "Long", stop=sl_price, comment="SL")
+    if exit_long
+        strategy.close("Long", comment="Exit SMA/RSI")
+
+// --- SHORT ---
+if short_condition and strategy.position_size == 0
+    strategy.entry("Short", strategy.short, comment="RSI2 overbought")
+    entry_price := close
+    sl_price    := use_sl ? close + sl_atr_mult * atr14 : na
+
+if strategy.position_size < 0
+    if use_sl and not na(sl_price)
+        strategy.exit("Short SL", "Short", stop=sl_price, comment="SL")
+    if exit_short
+        strategy.close("Short", comment="Exit SMA/RSI")
+
+// =============================================================================
+// VISUALISATION DES SIGNAUX
+// =============================================================================
+plotshape(long_condition,  "Long",  shape.labelup,   location.belowbar, color.new(color.lime, 0), text="L", textcolor=color.black, size=size.small)
+plotshape(short_condition, "Short", shape.labeldown, location.abovebar, color.new(color.red,  0), text="S", textcolor=color.white, size=size.small)
+
+// Zones de survendu/suracheté sur fond
+bgcolor(above200 and rsi2 < rsi_entry_l ? color.new(color.lime,  90) : na, title="Oversold zone")
+bgcolor(below200 and rsi2 > rsi_entry_s ? color.new(color.red,   90) : na, title="Overbought zone")
+
+// =============================================================================
+// TABLE DE RÉSULTATS (coin haut-droite)
+// =============================================================================
+var table t = table.new(position.top_right, 2, 12,
+  border_width=1, border_color=color.gray,
+  bgcolor=color.new(color.black, 60))
+
+if barstate.islast
+    tot  = strategy.closedtrades
+    wins = strategy.wintrades
+    loss = strategy.losstrades
+    wr   = tot > 0 ? wins / tot * 100 : 0.0
+    pf   = strategy.grossloss != 0 ? strategy.grossprofit / math.abs(strategy.grossloss) : 0.0
+    net  = strategy.netprofit
+    dd   = strategy.max_drawdown_percent
+    // Sharpe approximé : net PnL / max_drawdown (heuristique simple)
+    // Le vrai Sharpe est lisible dans l'onglet Métriques du Strategy Tester
+    avg_trade = tot > 0 ? net / tot : 0.0
+
+    hdr = color.new(color.navy, 50)
+    table.cell(t, 0, 0, "RSI2 CONNORS",  text_color=color.white,  text_size=size.small, bgcolor=hdr)
+    table.cell(t, 1, 0, "RÉSULTAT",      text_color=color.white,  text_size=size.small, bgcolor=hdr)
+    table.cell(t, 0, 1,  "Trades",       text_color=color.silver, text_size=size.small)
+    table.cell(t, 1, 1,  str.tostring(tot),
+               text_color=tot >= 100 ? color.lime : color.orange, text_size=size.small)
+    table.cell(t, 0, 2,  "Win Rate",     text_color=color.silver, text_size=size.small)
+    table.cell(t, 1, 2,  str.tostring(wr, "#.1") + "%",
+               text_color=wr >= 60 ? color.lime : wr >= 50 ? color.yellow : color.red, text_size=size.small)
+    table.cell(t, 0, 3,  "Profit Factor",text_color=color.silver, text_size=size.small)
+    table.cell(t, 1, 3,  str.tostring(pf, "#.##"),
+               text_color=pf >= 1.5 ? color.lime : pf >= 1.0 ? color.yellow : color.red, text_size=size.small)
+    table.cell(t, 0, 4,  "Net P&L",      text_color=color.silver, text_size=size.small)
+    table.cell(t, 1, 4,  str.tostring(net, "#.#") + " USD",
+               text_color=net > 0 ? color.lime : color.red, text_size=size.small)
+    table.cell(t, 0, 5,  "Max DD %",     text_color=color.silver, text_size=size.small)
+    table.cell(t, 1, 5,  str.tostring(dd, "#.##") + "%",
+               text_color=dd < 15 ? color.lime : dd < 30 ? color.yellow : color.red, text_size=size.small)
+    table.cell(t, 0, 6,  "Avg P&L/Trade", text_color=color.silver, text_size=size.small)
+    table.cell(t, 1, 6,  str.tostring(avg_trade, "#.##") + " USD",
+               text_color=avg_trade > 0 ? color.lime : color.red, text_size=size.small)
+    table.cell(t, 0, 7,  "W / L",        text_color=color.silver, text_size=size.small)
+    table.cell(t, 1, 7,  str.tostring(wins) + " / " + str.tostring(loss),
+               text_color=color.silver, text_size=size.small)
+    table.cell(t, 0, 8,  "Gross Profit", text_color=color.silver, text_size=size.small)
+    table.cell(t, 1, 8,  str.tostring(strategy.grossprofit, "#.#") + " USD",
+               text_color=color.lime, text_size=size.small)
+    table.cell(t, 0, 9,  "Gross Loss",   text_color=color.silver, text_size=size.small)
+    table.cell(t, 1, 9,  str.tostring(strategy.grossloss, "#.#") + " USD",
+               text_color=color.red, text_size=size.small)
+    table.cell(t, 0, 10, "RSI seuil",    text_color=color.gray,   text_size=size.small)
+    table.cell(t, 1, 10, str.tostring(rsi_entry_l) + " / " + str.tostring(rsi_entry_s),
+               text_color=color.gray, text_size=size.small)
+    table.cell(t, 0, 11, "Exit method",  text_color=color.gray,   text_size=size.small)
+    table.cell(t, 1, 11, exit_method,    text_color=color.gray,   text_size=size.small)

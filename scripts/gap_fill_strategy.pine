@@ -1,0 +1,275 @@
+// =============================================================================
+// GAP FILL STRATEGY — SPY Intraday (5 min)
+// Source : quantifiedstrategies.com/gap-fill-trading-strategies/
+// Auteur : Larry Connors / Quantified Strategies
+//
+// RÈGLES ORIGINALES
+// -----------------------------------------------------------------------------
+//  1. SPY ouvre avec un gap BAS entre -0.15% et -0.6%
+//  2. Filtre range : (close[D-1] - low[D-1]) / (high[D-1] - low[D-1]) < 0.25
+//     → La veille a clôturé dans le quart inférieur de sa range (signe de faiblesse)
+//  3. Entrée : au MARCHÉ à l'ouverture (9h30 NY)
+//  4. TP : 75% du gap comblé = Open + 0.75 × (Close_D-1 - Open)
+//  5. Exit EOD : fermeture forcée à 15h55 si TP non atteint
+//  6. Pas de stop-loss intraday mentionné dans la source
+//
+// RÉSULTATS REPORTÉS (source, jan 2010 – août 2012)
+//  - 110 signaux → 98 gagnants = 89% WR
+//  - Gain moyen par trade : +0.19%
+//
+// POURQUOI ON UTILISE LE 5-MIN ET PAS LE DAILY
+// -----------------------------------------------------------------------------
+//  Sur graphique Daily, Pine Script ne peut pas simuler simultanément :
+//    - une entrée à l'ouverture (open)
+//    - un TP intraday (limit order pendant la journée)
+//    - une sortie EOD au close
+//  Le 5-min résout ça : on entre à 9h30, TP actif toute la session, SOD à 15h55.
+//  C'est aussi exactement comment ce serait automatisé en pratique :
+//    Pre-market → check filtre range. À 9h30 → check gap → order.
+//
+// LIMITES DE CE BACKTEST
+// -----------------------------------------------------------------------------
+//  1. request.security() sur D pour les données J-1 peut avoir un léger biais
+//     sur la première barre de la journée (Pine v6 avec lookahead=off est safe)
+//  2. Slippage à l'ouverture : les 5 premières minutes d'un jour de gap peuvent
+//     être très volatiles. Le slippage réel peut dépasser 1 tick.
+//  3. Les données 5-min TradingView Free sont limitées (~2 ans). Pour plus
+//     d'historique, utiliser un compte Pro ou des données alternatives.
+//  4. La stratégie est LONG ONLY. Le gap UP n'est pas traité (stratégie miroir
+//     possible mais historiquement moins fiable sur SPY).
+//  5. Biais de survie : SPY en bull market depuis 2020. Les résultats sur 2008
+//     ou 2022 seraient différents → tester sur une période complète si possible.
+//
+// AUTOMATISATION RÉELLE (comment l'implémenter en live)
+// -----------------------------------------------------------------------------
+//  Avant ouverture (9h00–9h29) :
+//    - Requête API : SPY close, high, low de la veille
+//    - Calcul filtre range : (close-low)/(high-low) < 0.25
+//  À 9h30:00 exactement :
+//    - Récupérer prix d'ouverture (last trade ou bid/ask mid)
+//    - Calculer gap_pct = (open - prev_close) / prev_close * 100
+//    - Si -0.6 ≤ gap_pct ≤ -0.15 ET filtre range OK :
+//        - Envoyer ordre MARKET BUY
+//        - Placer ordre LIMIT SELL à TP = open + 0.75 × (prev_close - open)
+//        - Placer ordre TIME-BASED CLOSE à 15h55 (cancel si TP atteint avant)
+//  Commission typique algorithme ETF : ~$0.005/share (Alpaca, IBKR Lite)
+// =============================================================================
+
+//@version=6
+strategy(
+  title               = "Gap Fill Strategy — SPY 5min",
+  shorttitle          = "GAPFILL",
+  overlay             = true,
+  initial_capital     = 10000,
+  default_qty_type    = strategy.percent_of_equity,
+  default_qty_value   = 95,          // ~95% du capital investi (laisse marge pour fees)
+  commission_type     = strategy.commission.percent,
+  commission_value    = 0.01,        // 0.01% = très réaliste pour ETF algorithmique
+  slippage            = 2,           // 2 ticks = conservateur pour ouverture volatile
+  calc_on_order_fills = false,
+  process_orders_on_close = false
+)
+
+// =============================================================================
+// PARAMÈTRES (tous exposés pour faciliter l'audit)
+// =============================================================================
+grp_gap  = "Gap Parameters"
+gap_min  = input.float(-0.6,  "Gap min (%)",   group=grp_gap, minval=-5.0,  maxval=-0.01,
+            tooltip="Connors original : -0.6%. Gap trop grand → moins de chances de fill.")
+gap_max  = input.float(-0.15, "Gap max (%)",   group=grp_gap, minval=-2.0,  maxval=-0.01,
+            tooltip="Connors original : -0.15%. Gap trop petit → faible edge.")
+
+grp_flt  = "Filtres"
+use_range_filter = input.bool(true,  "Filtre range J-1",  group=grp_flt,
+            tooltip="(close-low)/(high-low) < seuil. Filtre Connors original.")
+range_thr = input.float(0.25, "Seuil range J-1 (<)",     group=grp_flt, minval=0.05, maxval=0.95,
+            tooltip="Connors : < 0.25 (clôture dans le quart bas de la range).")
+use_sma_filter = input.bool(false, "Filtre SMA 200D (prix > SMA)",  group=grp_flt,
+            tooltip="Optionnel : éviter d'être long en bear market prolongé.")
+sma200_len = input.int(200, "Période SMA filtre",         group=grp_flt, minval=50)
+
+grp_exit = "Exit Parameters"
+tp_pct   = input.float(0.75, "TP = X% du gap",  group=grp_exit, minval=0.1, maxval=2.0,
+            tooltip="Connors : 75% du gap. 100% = full gap fill.")
+eod_hour = input.int(15,  "Heure SOD exit (hh)",  group=grp_exit, minval=14, maxval=15)
+eod_min  = input.int(55,  "Minute SOD exit (mm)", group=grp_exit, minval=0,  maxval=59)
+use_hard_sl = input.bool(false, "Activer Stop Loss dur", group=grp_exit,
+            tooltip="Connors ne recommande pas de SL. Activer pour mesurer l'impact.")
+sl_pct   = input.float(1.0,  "Stop Loss (% en dessous de l'open)", group=grp_exit, minval=0.1, maxval=5.0)
+
+grp_time = "Filtre Temporel"
+trade_monday = input.bool(true,  "Lundi",    group=grp_time)
+trade_tuesday= input.bool(true,  "Mardi",    group=grp_time)
+trade_wed    = input.bool(true,  "Mercredi", group=grp_time)
+trade_thurs  = input.bool(true,  "Jeudi",    group=grp_time)
+trade_friday = input.bool(true,  "Vendredi", group=grp_time)
+
+// =============================================================================
+// DONNÉES DAILY POUR LE CALCUL DU GAP ET DU FILTRE RANGE
+// On utilise request.security() pour obtenir les données J-1
+// lookahead_off = pas de biais futur (pine v6 standard)
+// =============================================================================
+d_close = request.security(syminfo.tickerid, "D", close[1],  lookahead=barmerge.lookahead_off)
+d_high  = request.security(syminfo.tickerid, "D", high[1],   lookahead=barmerge.lookahead_off)
+d_low   = request.security(syminfo.tickerid, "D", low[1],    lookahead=barmerge.lookahead_off)
+d_sma200= request.security(syminfo.tickerid, "D", ta.sma(close, sma200_len), lookahead=barmerge.lookahead_off)
+
+// =============================================================================
+// DÉTECTION DE LA BARRE D'OUVERTURE (9h30 EST sur SPY)
+// On entre UNIQUEMENT sur la première barre de la session NYSE
+// =============================================================================
+is_entry_bar = hour(time, "America/New_York") == 9 and
+               minute(time, "America/New_York") == 30 and
+               dayofweek != dayofweek.saturday and
+               dayofweek != dayofweek.sunday
+
+// =============================================================================
+// CALCUL DU GAP
+// gap_pct < 0 = gap down (le marché ouvre plus bas que la veille)
+// =============================================================================
+gap_pct    = (open - d_close) / d_close * 100
+is_gap_down = gap_pct >= gap_min and gap_pct <= gap_max
+
+// =============================================================================
+// FILTRE RANGE J-1
+// (close_J1 - low_J1) / (high_J1 - low_J1) < 0.25
+// Interprétation : la veille a clôturé dans le quart bas de sa range
+// Signifie une session baissière finissant faible → gap down = sur-réaction
+// =============================================================================
+range_j1    = d_high - d_low
+range_pos_j1= range_j1 > 0 ? (d_close - d_low) / range_j1 : 0.5
+range_ok    = not use_range_filter or range_pos_j1 < range_thr
+
+// =============================================================================
+// FILTRE SMA 200D (optionnel)
+// =============================================================================
+sma_ok = not use_sma_filter or open > d_sma200
+
+// =============================================================================
+// FILTRE JOUR DE LA SEMAINE
+// =============================================================================
+dow = dayofweek
+dow_ok = (dow == dayofweek.monday    and trade_monday)  or
+         (dow == dayofweek.tuesday   and trade_tuesday) or
+         (dow == dayofweek.wednesday and trade_wed)     or
+         (dow == dayofweek.thursday  and trade_thurs)   or
+         (dow == dayofweek.friday    and trade_friday)
+
+// =============================================================================
+// CALCUL DU TAKE PROFIT
+// TP = open + tp_pct × (prev_close - open)
+// Ex: gap de -0.3%, open = 400, prev_close = 401.2
+//     gap absolu = 1.2 pts
+//     TP = 400 + 0.75 × 1.2 = 400.9
+// =============================================================================
+gap_abs = d_close - open   // positif car gap down (open < d_close)
+tp_price = open + tp_pct * gap_abs
+sl_price = open * (1 - sl_pct / 100)
+
+// =============================================================================
+// ENTRÉE CONDITIONNELLE
+// =============================================================================
+entry_signal = is_entry_bar and is_gap_down and range_ok and sma_ok and dow_ok and
+               strategy.position_size == 0 and gap_abs > 0
+
+if entry_signal
+    strategy.entry("Long", strategy.long, comment="Gap↓ " + str.tostring(gap_pct, "#.##") + "%")
+    strategy.exit("TP", "Long", limit=tp_price, comment="GapFill")
+    if use_hard_sl
+        strategy.exit("SL", "Long", stop=sl_price, comment="SL")
+
+// =============================================================================
+// SORTIE EOD (fin de session)
+// =============================================================================
+is_eod = hour(time, "America/New_York") == eod_hour and
+         minute(time, "America/New_York") == eod_min
+
+if is_eod and strategy.position_size > 0
+    strategy.close("Long", comment="EOD")
+
+// =============================================================================
+// VISUALISATION
+// =============================================================================
+// Fond vert sur barre d'ouverture quand signal actif
+bgcolor(entry_signal ? color.new(color.lime, 85) : na, title="Entry Bar")
+
+// Marqueur entrée
+plotshape(entry_signal, "Entry", shape.labelup, location.belowbar,
+          color.new(color.lime, 0), text="GAP↓", textcolor=color.black, size=size.small)
+
+// TP level sur la barre d'entrée
+plot(strategy.position_size > 0 ? tp_price : na, "TP Level",
+     color=color.new(color.lime, 30), linewidth=1, style=plot.style_linebr)
+
+// =============================================================================
+// TABLE DE RÉSULTATS
+// =============================================================================
+var table t = table.new(position.top_right, 2, 13,
+  border_width=1, border_color=color.gray,
+  bgcolor=color.new(color.black, 65))
+
+if barstate.islast
+    tot       = strategy.closedtrades
+    wins      = strategy.wintrades
+    loss      = strategy.losstrades
+    wr        = tot > 0 ? wins / tot * 100 : 0.0
+    pf        = strategy.grossloss != 0 ? strategy.grossprofit / math.abs(strategy.grossloss) : 0.0
+    net       = strategy.netprofit
+    dd        = strategy.max_drawdown_percent
+    avg_trade = tot > 0 ? net / tot : 0.0
+    avg_win   = wins > 0 ? strategy.grossprofit / wins : 0.0
+    avg_loss  = loss > 0 ? math.abs(strategy.grossloss) / loss : 0.0
+
+    hdr = color.new(color.navy, 50)
+    table.cell(t, 0, 0, "GAP FILL (SPY 5min)", text_color=color.white,  text_size=size.small, bgcolor=hdr)
+    table.cell(t, 1, 0, "RÉSULTAT",            text_color=color.white,  text_size=size.small, bgcolor=hdr)
+
+    table.cell(t, 0, 1,  "Trades",       text_color=color.silver, text_size=size.small)
+    table.cell(t, 1, 1,  str.tostring(tot),
+               text_color=tot >= 30 ? color.lime : color.orange, text_size=size.small)
+
+    table.cell(t, 0, 2,  "Win Rate",     text_color=color.silver, text_size=size.small)
+    table.cell(t, 1, 2,  str.tostring(wr, "#.1") + "%",
+               text_color=wr >= 70 ? color.lime : wr >= 55 ? color.yellow : color.red, text_size=size.small)
+
+    table.cell(t, 0, 3,  "Profit Factor",text_color=color.silver, text_size=size.small)
+    table.cell(t, 1, 3,  str.tostring(pf, "#.##"),
+               text_color=pf >= 2.0 ? color.lime : pf >= 1.0 ? color.yellow : color.red, text_size=size.small)
+
+    table.cell(t, 0, 4,  "Net P&L",      text_color=color.silver, text_size=size.small)
+    table.cell(t, 1, 4,  str.tostring(net, "#.#") + " USD",
+               text_color=net > 0 ? color.lime : color.red, text_size=size.small)
+
+    table.cell(t, 0, 5,  "Max DD %",     text_color=color.silver, text_size=size.small)
+    table.cell(t, 1, 5,  str.tostring(dd, "#.##") + "%",
+               text_color=dd < 10 ? color.lime : dd < 25 ? color.yellow : color.red, text_size=size.small)
+
+    // Sharpe lisible dans onglet "Métriques" du Strategy Tester (non accessible en Pine v6)
+    table.cell(t, 0, 6,  "CAGR approx",  text_color=color.silver, text_size=size.small)
+    cagr_approx = tot > 0 ? net / 10000 * 100 : 0.0
+    table.cell(t, 1, 6,  str.tostring(cagr_approx, "#.1") + "%",
+               text_color=cagr_approx > 0 ? color.lime : color.red, text_size=size.small)
+
+    table.cell(t, 0, 7,  "W / L",        text_color=color.silver, text_size=size.small)
+    table.cell(t, 1, 7,  str.tostring(wins) + " / " + str.tostring(loss),
+               text_color=color.silver, text_size=size.small)
+
+    table.cell(t, 0, 8,  "Avg win",      text_color=color.silver, text_size=size.small)
+    table.cell(t, 1, 8,  str.tostring(avg_win, "#.##") + " USD",
+               text_color=color.lime, text_size=size.small)
+
+    table.cell(t, 0, 9,  "Avg loss",     text_color=color.silver, text_size=size.small)
+    table.cell(t, 1, 9,  str.tostring(avg_loss, "#.##") + " USD",
+               text_color=color.red, text_size=size.small)
+
+    table.cell(t, 0, 10, "Avg P&L/trade",text_color=color.silver, text_size=size.small)
+    table.cell(t, 1, 10, str.tostring(avg_trade, "#.##") + " USD",
+               text_color=avg_trade > 0 ? color.lime : color.red, text_size=size.small)
+
+    table.cell(t, 0, 11, "Gap range",    text_color=color.gray,   text_size=size.small)
+    table.cell(t, 1, 11, str.tostring(gap_min) + "% → " + str.tostring(gap_max) + "%",
+               text_color=color.gray, text_size=size.small)
+
+    table.cell(t, 0, 12, "Source claim", text_color=color.gray,   text_size=size.small)
+    table.cell(t, 1, 12, "89% WR / +0.19%/tr",
+               text_color=color.gray, text_size=size.small)
