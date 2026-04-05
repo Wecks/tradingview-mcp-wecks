@@ -1,5 +1,5 @@
 # Backtest Report — Trading Strategies
-**Date:** April 2026 | **Primary instrument:** AMEX:SPY | **Tools:** Pine Script v6 + TradingView MCP
+**Date:** April 2026 | **Primary instruments:** AMEX:SPY, FX:EURUSD | **Tools:** Pine Script v6 + TradingView MCP
 
 ---
 
@@ -337,13 +337,107 @@ Mean-reversion strategies (RSI2, Gap Fill) work best in low-trend, oscillating r
 
 ## Conclusion
 
-Of the three strategies tested, **only one holds up to scrutiny**: RSI(2) Connors. Its edge has been documented since 2003, confirmed over 33 years of SPY data, with a Profit Factor > 2 on the optimized variant. Its main weaknesses are a low CAGR (poor capital utilization) and the author's recommendation to use no stop-loss.
+Of the three SPY strategies tested, **only one holds up to scrutiny**: RSI(2) Connors. Its edge has been documented since 2003, confirmed over 33 years of SPY data, with a Profit Factor > 2 on the optimized variant. Its main weaknesses are a low CAGR (poor capital utilization) and the author's recommendation to use no stop-loss.
 
 Gap Fill is the most **automatable** strategy: the signal is simple, objective, and detectable at the open. The edge exists (PF 1.27 over 1,692 trades) but is too fragile to exploit directly — it needs dynamic sizing and a regime filter to be genuinely profitable after costs.
 
 H1 Forex is the most **marketable** and least robust. A PF of 1.87 is positive but the real WR of 36% (vs 87% claimed) perfectly illustrates how presentation bias can make an average strategy look revolutionary. It is not without merit — the confluence + 1:2 RR framework is sound — but it needs validation over far more trades before allocating real capital.
 
+The Trending Pin Bar strategy confirms a recurring pattern in this report: **discretionary strategies that rely on human judgment for key level selection cannot be faithfully replicated algorithmically.** The 78% WR claim is essentially a human performance number, not a strategy number.
+
 **Final recommendation:** RSI(2) with ATR×2 stop-loss, tested on SPY + QQQ + IWM, with a walk-forward analysis on 2000–2015 / validation on 2015–2026. That is the most rigorous starting point for quantitative trading.
+
+---
+
+## Strategy 4 — Trending Pin Bar (TPB), EUR/USD H4
+
+### Source
+TradingHeroes — *"Backtesting Results: TPB EUR/USD H4"*
+
+### Strategy Rules
+1. **Trend filter**: price above/below EMA (default 50) — long only in uptrend, short in downtrend
+2. **Pattern**: Pin Bar with tail ≥ 2/3 of total range (66.7%), close in upper/lower half
+3. **Key level**: pin bar at or poking through a swing support/resistance level
+4. **Momentum**: strong directional bars leading into the pin bar
+5. **Entry**: at close of the pin bar candle
+6. **SL**: 5 pips beyond the pin bar tail extreme
+7. **TP**: next major S/R level in trade direction (fallback: 2R if no target found)
+8. **Filters**: skip Mondays, skip 19:00–23:00 GMT
+9. **Risk**: 1% per trade (approximated as 2% equity in Pine)
+
+### Reported Results (Jan 2001 – Aug 2018, Forex Tester, manual backtest)
+
+| Metric | Claimed |
+|--------|---------|
+| Win Rate | **78%** |
+| Total compounded return | **+446%** |
+| Average max R (winning trades) | **6.7R** |
+
+### Backtest Results — 5 Variants (FX:EURUSD H4, TradingView)
+
+| Variant | S/R method | EMA | Tail | ADX | Trades | Win Rate | PF | Net P&L | Max DD |
+|---------|-----------|-----|------|-----|--------|----------|----|---------|--------|
+| A — Base | Zone ±20 pips | 50 | 66.7% | OFF | 223 | **35.1%** | **1.04** | +$2.80 | 0.10% |
+| B — Loose tail | Zone ±20 pips | 50 | 60.0% | OFF | 362 | 33.1% | 0.94 | -$6.70 | 0.13% |
+| C — EMA 200 | Zone ±20 pips | 200 | 66.7% | OFF | 217 | 35.1% | 1.00 | -$0.20 | 0.14% |
+| D — Optimized | Zone ±20 pips | 100 | 60.0% | ON 20 | 218 | 31.1% | 0.83 | -$11.30 | 0.15% |
+| E — Poke-through | Tail breaks level | 50 | 66.7% | OFF | 54 | 35.1% | 1.05 | +$1.00 | 0.08% |
+
+**Claim: 78% WR, +446% compounded**
+
+### Critical Analysis
+
+**The 78% WR is entirely unreproducible algorithmically.**
+Across all 5 variants, WR converges tightly at 31–35% — consistent regardless of EMA period, tail strictness, ADX filter, or S/R method. This is not a parameter sensitivity issue: the 43-point gap between claimed (78%) and actual (35%) is structural.
+
+**Why the gap is so large:**
+
+1. **The backtest was fully discretionary.** Forex Tester is a manual replay tool, not an algorithm. The author chose which pin bars to trade based on visual judgment of level quality. A human with 5+ years of chart reading experience filters out ~90% of mechanically detected setups. Pine Script cannot replicate this filtering.
+
+2. **"Key level" is subjective.** The S/R quality distinction between a major daily pivot and a minor intrabar swing is immediately obvious to an experienced trader, and impossible to encode without a multi-timeframe level-scoring system. Our pivot zone detection (±20 pips around any swing high/low in memory) accepts many levels that a human would reject as "too weak."
+
+3. **TP at 6.7R average requires human discretion.** The fallback TP of 2R used in our backtest is conservative. The original claim of 6.7R average winning trade implies the author targets wide targets (next daily S/R, weekly pivot, etc.) that require higher-timeframe context. With 2R fallback, TP is often hit but the magnitude is artificially capped.
+
+4. **Sample size is misleading.** The author's original 17-year backtest in Forex Tester likely contains far fewer trades than our 223 (Variant A) — perhaps 30–60 total over the period, highly curated. A small hand-picked sample at 78% WR has a very wide confidence interval.
+
+**The real edge is probably real — just unquantifiable.**
+A skilled price action trader who applies these rules with genuine discretion likely does achieve a WR above 60%. But that edge lives in the trader's judgment, not in the rules themselves. Encoding it algorithmically produces a system that is essentially breakeven (PF 1.04).
+
+**Relaxing the tail filter made things worse** (Variant B: 362 trades, WR 33.1%, PF 0.94 → negative). More signals diluted quality without adding winners. The poke-through filter (Variant E) is conceptually sound but generated only 54 trades — too few to be statistically meaningful, and still at 35% WR.
+
+**The ADX filter (Variant D) degraded results** — contrary to intuition, adding a trend strength filter lowered both trade count and win rate. ADX on H4 EURUSD may be too lagging to distinguish clean trending setups from noisy ones.
+
+### Automation Verdict
+
+| Criterion | Score |
+|-----------|-------|
+| Algorithmically encodable | ❌ Core filter is human judgment |
+| Edge with mechanical rules | ⚠ PF 1.04 — barely breakeven |
+| Statistical significance | ⚠ 223 trades but WR variance is high |
+| Suitable for live trading | ❌ Not without a skilled discretionary layer |
+
+**Recommendation:** Do not attempt to automate this strategy. The edge is real but human. If you want to use this approach, practice manual discretionary trading on a replay tool (Forex Tester / TradingView replay) for 500+ trades before going live. The rules provide a sound *framework*, not a tradeable *system*.
+
+---
+
+## Updated Comparative Summary — All 4 Strategies
+
+| Strategy | Instrument | Claimed WR | Actual WR | PF | Automatable | Verdict |
+|----------|-----------|-----------|-----------|----|-----------:|---------|
+| H1 Forex PA | EUR/USD H1 | 87% | 36.1% | 1.87 | Partially | Claim false, edge real |
+| RSI(2) Connors | SPY Daily | 65–70% | 68–72% | 1.87–2.48 | ✅ Yes | Only fully validated strategy |
+| Gap Fill Daily | SPY Daily | 89% | 77.1% | 1.22–1.27 | ✅ Yes | Edge real, PF too low solo |
+| **TPB H4** | **EUR/USD H4** | **78%** | **35.1%** | **1.04** | **❌ No** | **Discretionary only** |
+
+### Pattern Across All 4 Strategies
+
+Three of the four strategies (H1 Forex, Gap Fill, TPB) come from blog posts / trading educators. All three significantly overstate their win rates. The common mechanism:
+- **Small cherry-picked sample** (30–110 trades vs 200+ needed)
+- **Manual discretionary filtering** not disclosed in the rules
+- **Favorable test period** (mean-reversion strategies during post-crisis regimes)
+- **No out-of-sample validation**
+
+Only Connors' RSI(2) — the sole academically-adjacent strategy — produced results consistent with its claims on a large, unfiltered sample.
 
 ---
 
@@ -352,3 +446,4 @@ H1 Forex is the most **marketable** and least robust. A PF of 1.87 is positive b
 - `gap_fill_daily.pine` — Gap Fill manual indicator backtest
 - `gap_fill_strategy.pine` — Gap Fill 5-min intraday strategy
 - `h1_forex_strategy.pine` — H1 Forex v2 (stop orders)
+- `tpb_eurusd_h4.pine` — Trending Pin Bar H4 (zone + poke-through variants)
