@@ -1,0 +1,328 @@
+// =============================================================================
+// TRENDING PIN BAR (TPB) STRATEGY — EUR/USD H4
+// Source: tradingheroes.com/backtesting-results-tpb-eurusd-h4/
+//
+// ORIGINAL RULES
+// -----------------------------------------------------------------------------
+//  1. Trend:   price above/below EMA (trend direction filter)
+//  2. Pattern: Pin Bar with tail ≥ 2/3 of total range (66.7%)
+//              Close must be in upper/lower half of range
+//  3. Level:   Pin bar at a key support/resistance level (swing pivot)
+//              OR pin bar tail pokes outside consolidation zone
+//  4. Momentum: strong directional bars leading into the pin bar
+//  5. Entry:   at close of pin bar candle
+//  6. SL:      5 pips beyond the pin bar tail extreme
+//  7. TP:      next major S/R level in trade direction
+//              Fallback: 2R if no S/R target found
+//  8. Filters: no Monday, no 19:00–23:00 GMT
+//  9. Risk:    1% per trade (simulated via 2% equity, no leverage modeling)
+//
+// REPORTED RESULTS (Jan 2001 – Aug 2018, Forex Tester)
+//  - Win Rate:          78%
+//  - Total return:     +446% compounded
+//  - Avg max R (wins):  6.7R
+//
+// DESIGN NOTES
+// -----------------------------------------------------------------------------
+//  - Entry executes at next bar's open (realistic: you see the close, click buy)
+//  - TP is the nearest pivot above/below entry exceeding min RR
+//  - Fallback TP used when no valid S/R target exists
+//  - Pivots have swing_len bar lag (non-repainting, no lookahead bias)
+//  - ADX filter optional (not in original rules, added for optimization)
+// =============================================================================
+
+//@version=6
+strategy(
+    title             = "Trending Pin Bar (TPB) — EUR/USD H4",
+    shorttitle        = "TPB-H4",
+    overlay           = true,
+    initial_capital   = 10000,
+    default_qty_type  = strategy.percent_of_equity,
+    default_qty_value = 2,
+    commission_type   = strategy.commission.percent,
+    commission_value  = 0.003,
+    slippage          = 1,
+    calc_on_order_fills  = false,
+    process_orders_on_close = false
+)
+
+// =============================================================================
+// PARAMETERS
+// =============================================================================
+grp_trend = "Trend"
+ema_len   = input.int(50, "Trend EMA period", group=grp_trend, minval=10, maxval=300,
+            tooltip="Price above EMA = uptrend (longs only). Below = downtrend (shorts only).")
+
+grp_pb = "Pin Bar"
+pb_tail = input.float(66.7, "Min tail % of range", group=grp_pb, minval=40.0, maxval=90.0,
+          tooltip="Original: 2/3 = 66.7%. Lower = more trades, less strict.")
+pb_body = input.float(33.3, "Max body % of range", group=grp_pb, minval=5.0, maxval=50.0)
+
+grp_kl = "Key Levels (S/R)"
+swing_len  = input.int(10,   "Pivot lookback (bars)", group=grp_kl, minval=3, maxval=30)
+zone_pips  = input.float(20.0, "S/R zone (pips)",     group=grp_kl, minval=5.0, maxval=60.0)
+max_pivots = input.int(8,    "Pivots in memory",       group=grp_kl, minval=3, maxval=20)
+use_poke   = input.bool(true, "Require tail to poke through level", group=grp_kl,
+             tooltip="Bullish: low <= pivot_low AND close > pivot_low (tail poked below, closed above). Bearish: high >= pivot_high AND close < pivot_high.")
+
+grp_risk = "Risk / Reward"
+sl_buf      = input.float(5.0, "SL buffer (pips)",          group=grp_risk, minval=1.0, maxval=20.0)
+min_rr      = input.float(1.0, "Min RR to take trade",      group=grp_risk, minval=0.5, maxval=3.0)
+fallback_rr = input.float(2.0, "Fallback RR (no S/R found)",group=grp_risk, minval=1.0, maxval=6.0)
+
+grp_flt = "Filters"
+skip_monday   = input.bool(true,  "Skip Mondays",                    group=grp_flt)
+skip_night    = input.bool(true,  "Skip 19:00–23:00 GMT",            group=grp_flt)
+use_momentum  = input.bool(true,  "Momentum filter (2/3 bars align)", group=grp_flt,
+               tooltip="At least 2 of the 3 bars before the pin bar close in trend direction.")
+use_adx       = input.bool(false, "ADX trend filter",                group=grp_flt)
+adx_min       = input.float(20.0, "ADX minimum",                     group=grp_flt, minval=10.0, maxval=50.0)
+
+grp_vis = "Display"
+show_ema    = input.bool(true,  "Show EMA",           group=grp_vis)
+show_pivots = input.bool(false, "Show pivot markers", group=grp_vis)
+show_zones  = input.bool(false, "Show S/R zones",     group=grp_vis)
+
+// =============================================================================
+// PIP SIZE
+// =============================================================================
+pip = syminfo.mintick * 10
+
+// =============================================================================
+// TREND — EMA
+// =============================================================================
+ema        = ta.ema(close, ema_len)
+is_up      = close > ema
+is_down    = close < ema
+plot(show_ema ? ema : na, "EMA", color=is_up ? color.teal : color.red, linewidth=2)
+
+// =============================================================================
+// MOMENTUM — 2 of last 3 bars close in trend direction
+// =============================================================================
+bull_count = (close[1] > open[1] ? 1 : 0) + (close[2] > open[2] ? 1 : 0) + (close[3] > open[3] ? 1 : 0)
+bear_count = (close[1] < open[1] ? 1 : 0) + (close[2] < open[2] ? 1 : 0) + (close[3] < open[3] ? 1 : 0)
+mom_up     = not use_momentum or bull_count >= 2
+mom_down   = not use_momentum or bear_count >= 2
+
+// =============================================================================
+// ADX
+// =============================================================================
+[_, _, adx_val] = ta.dmi(14, 14)
+adx_ok = not use_adx or adx_val >= adx_min
+
+// =============================================================================
+// SWING PIVOTS & S/R DETECTION
+// =============================================================================
+ph = ta.pivothigh(high, swing_len, swing_len)
+pl = ta.pivotlow(low,  swing_len, swing_len)
+
+var array<float> pivot_highs = array.new_float(0)
+var array<float> pivot_lows  = array.new_float(0)
+
+if not na(ph)
+    array.unshift(pivot_highs, ph)
+    if array.size(pivot_highs) > max_pivots
+        array.pop(pivot_highs)
+
+if not na(pl)
+    array.unshift(pivot_lows, pl)
+    if array.size(pivot_lows) > max_pivots
+        array.pop(pivot_lows)
+
+zone = zone_pips * pip
+
+// Zone-based detection (used when use_poke = false)
+at_res_zone = false
+if array.size(pivot_highs) > 0
+    for i = 0 to array.size(pivot_highs) - 1
+        if math.abs(close - array.get(pivot_highs, i)) <= zone
+            at_res_zone := true
+            break
+
+at_sup_zone = false
+if array.size(pivot_lows) > 0
+    for i = 0 to array.size(pivot_lows) - 1
+        if math.abs(close - array.get(pivot_lows, i)) <= zone
+            at_sup_zone := true
+            break
+
+// Poke-through detection: tail must breach the pivot level, close must recover
+// Bullish: low <= pivot_low AND close > pivot_low  (tail poked below support, closed above)
+// Bearish: high >= pivot_high AND close < pivot_high (tail poked above resistance, closed below)
+at_sup_poke = false
+if array.size(pivot_lows) > 0
+    for i = 0 to array.size(pivot_lows) - 1
+        pvl = array.get(pivot_lows, i)
+        if low <= pvl and close > pvl
+            at_sup_poke := true
+            break
+
+at_res_poke = false
+if array.size(pivot_highs) > 0
+    for i = 0 to array.size(pivot_highs) - 1
+        pvh = array.get(pivot_highs, i)
+        if high >= pvh and close < pvh
+            at_res_poke := true
+            break
+
+at_level = use_poke ? (at_res_poke or at_sup_poke) : (at_res_zone or at_sup_zone)
+
+plotshape(show_pivots and not na(ph), "PH", shape.triangledown, location.abovebar, color.new(color.red,   40), size=size.tiny)
+plotshape(show_pivots and not na(pl), "PL", shape.triangleup,   location.belowbar, color.new(color.green, 40), size=size.tiny)
+
+// =============================================================================
+// PIN BAR DETECTION
+// =============================================================================
+bar_range  = high - low
+bar_body   = math.abs(close - open)
+wick_up    = high - math.max(close, open)
+wick_down  = math.min(close, open) - low
+safe_range = bar_range == 0 ? syminfo.mintick : bar_range
+
+// Bullish: dominant lower wick, close in upper half
+pb_bull = wick_down / safe_range * 100 >= pb_tail and
+          bar_body  / safe_range * 100 <= pb_body  and
+          close >= low + bar_range * 0.5
+
+// Bearish: dominant upper wick, close in lower half
+pb_bear = wick_up   / safe_range * 100 >= pb_tail and
+          bar_body  / safe_range * 100 <= pb_body  and
+          close <= high - bar_range * 0.5
+
+// =============================================================================
+// TIME FILTERS
+// =============================================================================
+bar_hour   = hour(time, "UTC")
+time_ok    = (not skip_night  or not (bar_hour >= 19 and bar_hour <= 22)) and
+             (not skip_monday or dayofweek != dayofweek.monday)
+
+// =============================================================================
+// ENTRY CONDITIONS
+// =============================================================================
+// When use_poke is ON: longs need sup poke, shorts need res poke (directionally specific)
+// When use_poke is OFF: either zone triggers either direction
+long_at_level  = use_poke ? at_sup_poke : (at_res_zone or at_sup_zone)
+short_at_level = use_poke ? at_res_poke : (at_res_zone or at_sup_zone)
+
+long_sig  = is_up   and pb_bull and long_at_level  and mom_up   and time_ok and adx_ok and strategy.position_size == 0
+short_sig = is_down and pb_bear and short_at_level and mom_down and time_ok and adx_ok and strategy.position_size == 0
+
+// =============================================================================
+// SL / TP CALCULATION
+// =============================================================================
+buf = sl_buf * pip
+
+// LONG
+long_entry = close
+long_sl    = low  - buf
+long_risk  = long_entry - long_sl
+
+// Find nearest resistance above entry
+long_tp_sr = float(na)
+if long_sig and array.size(pivot_highs) > 0
+    nearest_d = 999999.0
+    for i = 0 to array.size(pivot_highs) - 1
+        p = array.get(pivot_highs, i)
+        if p > long_entry + pip * 5
+            d = p - long_entry
+            if d < nearest_d
+                nearest_d  := d
+                long_tp_sr := p
+
+long_tp = na(long_tp_sr) or (long_tp_sr - long_entry) < min_rr * long_risk ?
+          long_entry + fallback_rr * long_risk : long_tp_sr
+
+// SHORT
+short_entry = close
+short_sl    = high + buf
+short_risk  = short_sl - short_entry
+
+// Find nearest support below entry
+short_tp_sr = float(na)
+if short_sig and array.size(pivot_lows) > 0
+    nearest_d = 999999.0
+    for i = 0 to array.size(pivot_lows) - 1
+        p = array.get(pivot_lows, i)
+        if p < short_entry - pip * 5
+            d = short_entry - p
+            if d < nearest_d
+                nearest_d   := d
+                short_tp_sr := p
+
+short_tp = na(short_tp_sr) or (short_entry - short_tp_sr) < min_rr * short_risk ?
+           short_entry - fallback_rr * short_risk : short_tp_sr
+
+// =============================================================================
+// ORDERS
+// =============================================================================
+if long_sig
+    strategy.entry("Long", strategy.long, comment="TPB↑")
+    strategy.exit("LX", "Long", stop=long_sl, limit=long_tp)
+
+if short_sig
+    strategy.entry("Short", strategy.short, comment="TPB↓")
+    strategy.exit("SX", "Short", stop=short_sl, limit=short_tp)
+
+// =============================================================================
+// VISUALIZATION
+// =============================================================================
+plotshape(long_sig,  "Long",  shape.labelup,   location.belowbar, color.lime, text="TPB", textcolor=color.black, size=size.small)
+plotshape(short_sig, "Short", shape.labeldown, location.abovebar, color.red,  text="TPB", textcolor=color.white, size=size.small)
+
+plot(strategy.position_size > 0 ? long_tp   : na, "Long TP",  color.new(color.lime, 40), linewidth=1, style=plot.style_linebr)
+plot(strategy.position_size < 0 ? short_tp  : na, "Short TP", color.new(color.red,  40), linewidth=1, style=plot.style_linebr)
+plot(strategy.position_size != 0 ? (strategy.position_size > 0 ? long_sl : short_sl) : na, "SL",
+     color.new(color.orange, 40), linewidth=1, style=plot.style_linebr)
+
+// =============================================================================
+// STATS TABLE
+// =============================================================================
+var table t = table.new(position.top_right, 2, 12,
+    border_width=1, border_color=color.gray,
+    bgcolor=color.new(color.black, 65))
+
+if barstate.islast
+    tot  = strategy.closedtrades
+    wins = strategy.wintrades
+    loss = strategy.losstrades
+    wr   = tot > 0 ? wins / tot * 100 : 0.0
+    pf   = strategy.grossloss != 0 ? strategy.grossprofit / math.abs(strategy.grossloss) : 0.0
+    net  = strategy.netprofit
+    dd   = strategy.max_drawdown_percent
+    avg  = tot > 0 ? net / tot : 0.0
+
+    hdr = color.new(color.navy, 50)
+    table.cell(t, 0, 0,  "TPB EUR/USD H4",   text_color=color.white,  text_size=size.small, bgcolor=hdr)
+    table.cell(t, 1, 0,  "RESULT",           text_color=color.white,  text_size=size.small, bgcolor=hdr)
+    table.cell(t, 0, 1,  "Trades",           text_color=color.silver, text_size=size.small)
+    table.cell(t, 1, 1,  str.tostring(tot),
+               text_color=tot >= 100 ? color.lime : color.orange, text_size=size.small)
+    table.cell(t, 0, 2,  "Win Rate",         text_color=color.silver, text_size=size.small)
+    table.cell(t, 1, 2,  str.tostring(wr, "#.1") + "%",
+               text_color=wr >= 70 ? color.lime : wr >= 55 ? color.yellow : color.red, text_size=size.small)
+    table.cell(t, 0, 3,  "Profit Factor",    text_color=color.silver, text_size=size.small)
+    table.cell(t, 1, 3,  str.tostring(pf, "#.##"),
+               text_color=pf >= 2.0 ? color.lime : pf >= 1.0 ? color.yellow : color.red, text_size=size.small)
+    table.cell(t, 0, 4,  "Net P&L ($)",      text_color=color.silver, text_size=size.small)
+    table.cell(t, 1, 4,  str.tostring(net, "#.#") + " USD",
+               text_color=net > 0 ? color.lime : color.red, text_size=size.small)
+    table.cell(t, 0, 5,  "Max DD %",         text_color=color.silver, text_size=size.small)
+    table.cell(t, 1, 5,  str.tostring(dd, "#.##") + "%",
+               text_color=dd < 15 ? color.lime : dd < 30 ? color.yellow : color.red, text_size=size.small)
+    table.cell(t, 0, 6,  "Avg P&L / trade",  text_color=color.silver, text_size=size.small)
+    table.cell(t, 1, 6,  str.tostring(avg, "#.##") + " USD",
+               text_color=avg > 0 ? color.lime : color.red, text_size=size.small)
+    table.cell(t, 0, 7,  "W / L",            text_color=color.silver, text_size=size.small)
+    table.cell(t, 1, 7,  str.tostring(wins) + " / " + str.tostring(loss),
+               text_color=color.silver, text_size=size.small)
+    table.cell(t, 0, 8,  "Gross Profit",     text_color=color.silver, text_size=size.small)
+    table.cell(t, 1, 8,  str.tostring(strategy.grossprofit, "#.#") + " USD",
+               text_color=color.lime, text_size=size.small)
+    table.cell(t, 0, 9,  "Gross Loss",       text_color=color.silver, text_size=size.small)
+    table.cell(t, 1, 9,  str.tostring(strategy.grossloss, "#.#") + " USD",
+               text_color=color.red, text_size=size.small)
+    table.cell(t, 0, 10, "Params",           text_color=color.gray,   text_size=size.small)
+    table.cell(t, 1, 10, "EMA" + str.tostring(ema_len) + " / tail" + str.tostring(pb_tail, "#") + "%" + (use_poke ? " / POKE" : " / ZONE"),
+               text_color=color.gray, text_size=size.small)
+    table.cell(t, 0, 11, "Source claim",     text_color=color.gray,   text_size=size.small)
+    table.cell(t, 1, 11, "78% WR / +446%",  text_color=color.gray,   text_size=size.small)
